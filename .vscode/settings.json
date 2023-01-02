@@ -1,4 +1,6 @@
 {
+    "FSharp.trace.server": "off",
+    "FSharp.verboseLogging": false,
     "FSharp.excludeProjectDirectories": [
         ".git",
         "paket-files",
@@ -9,7 +11,6 @@
     //the test directories
     "omnisharp.autoStart": false,
     "FSharp.minimizeBackgroundParsing": true,
-    "FSharp.trace.server": "verbose",
     "yaml.schemas": {
       "https://raw.githubusercontent.com/SchemaStore/schemastore/master/src/schemas/json/github-workflow.json": ".github/workflows/*"
     },
