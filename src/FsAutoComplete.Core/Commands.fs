@@ -1396,6 +1396,8 @@ type Commands(checker: FSharpCompilerServiceChecker, state: State, hasAnalyzers:
   /// and if so registers them.
   member x.EnsureProjectOptionsForFile(file: string<LocalPath>, text: NamedText, version, fsiRefs) =
     async {
+      do! state.WaitForWorkspaceReady()
+
       match state.GetProjectOptions(file) with
       | Some opts ->
         match state.RefreshCheckerOptions(file, text) with

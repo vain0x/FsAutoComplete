@@ -182,6 +182,12 @@ type State =
       ColorizationOutput = false
       WorkspaceStateDirectory = workspaceStateDir }
 
+  member x.WaitForWorkspaceReady() : Async<unit> =
+    async {
+      while not x.ProjectController.IsWorkspaceReady do
+        do! x.ProjectController.WorkspaceReady |> Async.AwaitEvent
+    }
+
   member x.RefreshCheckerOptions(file: string<LocalPath>, text: NamedText) : FSharpProjectOptions option =
     x.ProjectController.GetProjectOptions(UMX.untag file)
     |> Option.map (fun opts ->
