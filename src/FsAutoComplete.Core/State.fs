@@ -10,6 +10,7 @@ open System.Diagnostics
 open FSharp.Compiler.EditorServices
 open FSharp.Compiler.Syntax
 open FSharp.Compiler.CodeAnalysis
+open FsAutoComplete.Logging
 open FsToolkit.ErrorHandling
 
 [<AutoOpen>]
@@ -144,6 +145,9 @@ type CompletionNamespaceInsert =
     Position: Position
     Scope: ScopeKind }
 
+module private State =
+
+  let internal stateLogger = LogProvider.getLoggerByName "State"
 
 [<DebuggerDisplay("{DebugString}")>]
 type State =
@@ -184,7 +188,8 @@ type State =
 
   member x.WaitForWorkspaceReady() : Async<unit> =
     async {
-      while not x.ProjectController.IsWorkspaceReady do
+      if x.ProjectController.IsWorkspaceReady |> not then
+        State.stateLogger.debug (Log.setMessage "WaitForWorkspaceRead")
         do! x.ProjectController.WorkspaceReady |> Async.AwaitEvent
     }
 
