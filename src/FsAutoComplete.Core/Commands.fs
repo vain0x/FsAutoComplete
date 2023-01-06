@@ -911,6 +911,10 @@ type Commands(checker: FSharpCompilerServiceChecker, state: State, hasAnalyzers:
   let notify = Event<NotificationEvent>()
 
   let fileStateSet = Event<unit>()
+
+  let mutable isWorkspaceReady = false
+  let workspaceReady = Event<unit>()
+
   let commandsLogger = LogProvider.getLoggerByName "Commands"
 
   let checkerLogger = LogProvider.getLoggerByName "CheckerEvents"
@@ -1375,12 +1379,21 @@ type Commands(checker: FSharpCompilerServiceChecker, state: State, hasAnalyzers:
     async {
       match checker.TryGetRecentCheckResultsForFile(file, opts, text) with
       | None ->
+        commandsLogger.debug (
+          Log.setMessage "GetRecent/3 none '{file}'"
+          >> Log.addContextDestructured "file" file
+        )
         let version = state.TryGetFileVersion file |> Option.defaultValue 0
 
         match! checker.ParseAndCheckFileInProject(file, version, text, opts) with
         | Ok r -> return Some r
         | Error _ -> return None
-      | Some r -> return Some r
+      | Some r ->
+        commandsLogger.debug (
+          Log.setMessage "GetRecent/3 some '{file}'"
+          >> Log.addContextDestructured "file" file
+        )
+        return Some r
     }
 
   member x.TryGetFileCheckerOptionsWithLinesAndLineStr(file: string<LocalPath>, pos) =
@@ -1939,6 +1952,10 @@ type Commands(checker: FSharpCompilerServiceChecker, state: State, hasAnalyzers:
       checker.DisableInMemoryProjectReferences <- disableInMemoryProjectReferences
       let! response = state.ProjectController.LoadWorkspace(files, binaryLogs)
       commandsLogger.info (Log.setMessage "Workspace loading finished")
+
+      isWorkspaceReady <- true
+      workspaceReady.Trigger()
+
       return CoreResponse.Res response
     }
 
