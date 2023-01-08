@@ -1,8 +1,11 @@
 namespace FsAutoComplete.Lsp
 
 open System
+open System.Collections.Generic
 open System.IO
 open System.Threading
+open System.Threading.Channels
+open System.Threading.Tasks
 open FsAutoComplete
 open FsAutoComplete.Core
 open FsAutoComplete.LspHelpers
@@ -1378,11 +1381,21 @@ type FSharpLspServer(state: State, lspClient: FSharpLspClient) =
     override _.TextDocumentDidClose(p) =
       async {
         logger.info (
-          Log.setMessage "TextDocumentDidOpen Request: {parms}"
+          Log.setMessage "TextDocumentDidClose Request: {parms}"
           >> Log.addContextDestructured "parms" p
         )
+        try
+          forgetDocument p.TextDocument.Uri
 
-        forgetDocument p.TextDocument.Uri
+          logger.info (
+            Log.setMessage "TextDocumentDidClose complete"
+          )
+        with ex ->
+          logger.info (
+            Log.setMessage "TextDocumentDidClose error"
+            >> Log.addExn ex
+          )
+          return raise ex
       }
 
     override __.TextDocumentCompletion(p: CompletionParams) =
@@ -2883,6 +2896,262 @@ type FSharpLspServer(state: State, lspClient: FSharpLspClient) =
     override x.Dispose() =
       (x :> ILspServer).Shutdown() |> Async.Start
 
+type FSharpLspServerWithLocking(inner: IFSharpLspServer) =
+
+  let logger = LogProvider.getLoggerByName "FSharpLspServerWithLocking"
+
+  let mutable isReady = false
+  let ready = Event<unit>()
+
+  let locker = obj()
+  let mutable rwStatus = 0
+  let acquired = ResizeArray()
+  let chan = Channel.CreateBounded<string * bool * TaskCompletionSource<_>>(1)
+
+  let releaseChan = Channel.CreateBounded<unit>(1)
+  let triggerReleased () =
+    releaseChan.Writer.WriteAsync(()) |> ignore
+    lock locker (fun () -> logger.debug(Log.setMessage "acquired list: {name}" << Log.addContextDestructured "name" acquired))
+
+  let eventAwaiter (e: IEvent<'T>) =
+    let tcs = new TaskCompletionSource<'T>()
+    let mutable disposable : IDisposable = null
+    disposable <- e.Subscribe(fun value ->
+      tcs.TrySetResult(value) |> ignore
+
+      match disposable with
+      | null -> ()
+      | d -> d.Dispose(); disposable <- null
+    )
+    tcs.Task
+
+  let acquireRo name : Async<IDisposable> =
+    async {
+      logger.debug (Log.setMessage "acquireRo enter {name}" >> Log.addContext "name" name)
+
+      if not isReady then
+        logger.debug (Log.setMessage "acquireRo waiting ready {name}" >> Log.addContext "name" name)
+        do! Async.AwaitEvent(ready.Publish)
+
+      let tcs = new TaskCompletionSource<unit>()
+      do! chan.Writer.WriteAsync((name, false, tcs)).AsTask() |> Async.AwaitTask
+      logger.debug (Log.setMessage "acquireRo waiting in chan {name}" >> Log.addContext "name" name)
+      do! tcs.Task |> Async.AwaitTask
+
+      logger.debug (Log.setMessage "acquireRo start {name}" >> Log.addContext "name" name)
+      lock locker (fun () -> acquired.Add(name))
+
+      return
+        { new IDisposable with
+            override _.Dispose() =
+              logger.debug (Log.setMessage "acquireRo exit {name}" >> Log.addContext "name" name)
+              lock locker (fun () -> assert (rwStatus >= 1); rwStatus <- rwStatus - 1)
+              lock locker (fun () -> acquired.Remove(name) |> ignore)
+              triggerReleased() }
+    }
+
+  let acquireRw name : Async<IDisposable> =
+    async {
+      logger.debug (Log.setMessage "acquireRw enter {name}" >> Log.addContext "name" name)
+
+      if not isReady then
+        logger.debug (Log.setMessage "acquireRw waiting ready {name}" >> Log.addContext "name" name)
+        do! Async.AwaitEvent(ready.Publish)
+
+      let tcs = new TaskCompletionSource<unit>()
+      do! chan.Writer.WriteAsync((name, true, tcs)).AsTask() |> Async.AwaitTask
+      logger.debug (Log.setMessage "acquireRw waiting in chan {name}" >> Log.addContext "name" name)
+      do! tcs.Task |> Async.AwaitTask
+
+      logger.debug (Log.setMessage "acquireRw start {name}" >> Log.addContext "name" name)
+      lock locker (fun () -> acquired.Add(name))
+
+      return
+        { new IDisposable with
+            override _.Dispose() =
+              logger.debug (Log.setMessage "acquireRw exit {name}" >> Log.addContext "name" name)
+              lock locker (fun () -> assert (rwStatus = -1); rwStatus <- 0)
+              lock locker (fun () -> acquired.Remove(name) |> ignore)
+              triggerReleased() }
+    }
+
+  let startLoop () =
+    logger.debug (Log.setMessage "startLoop")
+
+    let rec loop () =
+      task {
+        logger.debug (Log.setMessage "consumer reading next n={n}" >> Log.addContext "n" (lock locker (fun () -> rwStatus)))
+        let! (name, rw, tcs) = chan.Reader.ReadAsync()
+
+        if isNull tcs then
+          logger.debug (Log.setMessage "consumer exiting")
+          return ()
+        else
+          if rw then
+            while lock locker (fun () -> rwStatus <> 0) do
+              logger.debug (Log.setMessage "consumer waiting for rw '{name}' n={n}" >> Log.addContext "name" name >> Log.addContext "n" (lock locker (fun () -> rwStatus)))
+
+              try
+                do! releaseChan.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(15.))
+              with ex ->
+                logger.error (Log.setMessage "consumer error '{name}' n={n}" >> Log.addContext "name" name >> Log.addContext "n" (lock locker (fun () -> rwStatus)) >> Log.addExn ex )
+                lock locker (fun () -> logger.debug(Log.setMessage "acquired list: {name}" << Log.addContextDestructured "name" acquired))
+                lock locker (fun () -> rwStatus <- 0)
+
+            lock locker (fun () -> assert (rwStatus = 0); rwStatus <- -1)
+          else
+            while lock locker (fun () -> rwStatus = -1) do
+              logger.debug (Log.setMessage "consumer waiting for ro '{name}' n={n}" >> Log.addContext "name" name >> Log.addContext "n" (lock locker (fun () -> rwStatus)))
+
+              try
+                do! releaseChan.Reader.ReadAsync().AsTask().WaitAsync(TimeSpan.FromSeconds(15.)) // eventAwaiter(released.Publish).WaitAsync(TimeSpan.FromSeconds(15.))
+              with ex ->
+                logger.error (Log.setMessage "consumer error '{name}' n={n}" >> Log.addContext "name" name >> Log.addContext "n" (lock locker (fun () -> rwStatus)) >> Log.addExn ex )
+                lock locker (fun () -> logger.debug(Log.setMessage "acquired list: {name}" << Log.addContextDestructured "name" acquired))
+                lock locker (fun () -> rwStatus <- 0)
+
+            lock locker (fun () -> assert (rwStatus >= 0); rwStatus <- rwStatus + 1)
+
+          logger.debug (Log.setMessage "consumer unblock '{name}' n={n}" >> Log.addContext "name" name >> Log.addContext "n" (lock locker (fun () -> rwStatus)))
+
+          tcs.SetResult(())
+          return! loop()
+      }
+
+    loop () |> ignore
+
+  do
+    task {
+      do! Task.Delay(15 * 1000)
+      if not isReady then
+        startLoop() |> ignore
+
+        isReady <- true
+        logger.debug (Log.setMessage "triggering ready timeout")
+        ready.Trigger()
+
+        do! Task.Delay(1000)
+        logger.debug (Log.setMessage "triggering ready timeout again for sure")
+    } |> ignore
+
+  interface IFSharpLspServer with
+
+    //unsupported -- begin
+
+    override _.CodeActionResolve p = inner.CodeActionResolve(p)
+    override _.DocumentLinkResolve p = inner.DocumentLinkResolve(p)
+    override _.Exit() = inner.Exit()
+    override _.InlayHintResolve p = inner.InlayHintResolve(p)
+    override _.TextDocumentDocumentColor p = inner.TextDocumentDocumentColor(p)
+    override _.TextDocumentColorPresentation p = inner.TextDocumentColorPresentation(p)
+    override _.TextDocumentDocumentLink p = inner.TextDocumentDocumentLink(p)
+    override _.TextDocumentOnTypeFormatting p = inner.TextDocumentOnTypeFormatting(p)
+    override _.TextDocumentPrepareRename p = inner.TextDocumentPrepareRename(p)
+    override _.TextDocumentSemanticTokensFullDelta p = inner.TextDocumentSemanticTokensFullDelta(p)
+    override _.TextDocumentWillSave p = inner.TextDocumentWillSave(p)
+    override _.TextDocumentWillSaveWaitUntil p = inner.TextDocumentWillSaveWaitUntil(p)
+    override _.WorkspaceDidChangeWorkspaceFolders p = inner.WorkspaceDidChangeWorkspaceFolders(p)
+    override _.WorkspaceDidCreateFiles p = inner.WorkspaceDidCreateFiles(p)
+    override _.WorkspaceDidDeleteFiles p = inner.WorkspaceDidDeleteFiles(p)
+    override _.WorkspaceDidRenameFiles p = inner.WorkspaceDidRenameFiles(p)
+    override _.WorkspaceExecuteCommand p = inner.WorkspaceExecuteCommand(p)
+    override _.WorkspaceWillCreateFiles p = inner.WorkspaceWillCreateFiles(p)
+    override _.WorkspaceWillDeleteFiles p = inner.WorkspaceWillDeleteFiles(p)
+    override _.WorkspaceWillRenameFiles p = inner.WorkspaceWillRenameFiles(p)
+
+    //unsupported -- end
+
+    override _.Shutdown() = inner.Shutdown()
+    override _.Initialize(p) = inner.Initialize(p)
+    override _.Initialized(p) = inner.Initialized(p)
+
+    // writer requests
+
+    override _.TextDocumentDidOpen(p) = async { let! result = async { use! _scope = acquireRw "didOpen" in return! inner.TextDocumentDidOpen(p) } in return result }
+    override _.TextDocumentDidChange(p) = async { let! result = async { use! _scope = acquireRw "didChange" in return! inner.TextDocumentDidChange(p) } in return result }
+    override _.TextDocumentDidSave(p) = async { let! result = async { use! _scope = acquireRw "TextDocumentDidSave" in return! inner.TextDocumentDidSave(p) } in return result }
+    override _.TextDocumentDidClose(p) = async { let! result = async { use! _scope = acquireRw "didClose" in return! inner.TextDocumentDidClose(p) } in return result }
+    override _.WorkspaceDidChangeWatchedFiles(p) = async { let! result = async { use! _scope = acquireRw "WorkspaceDidChangeWatchedFiles" in return! inner.WorkspaceDidChangeWatchedFiles(p) } in return result }
+    override _.WorkspaceDidChangeConfiguration(p) = async { let! result = async { use! _scope = acquireRw "WorkspaceDidChangeConfiguration" in return! inner.WorkspaceDidChangeConfiguration(p) } in return result }
+
+    // reader requests
+
+    override _.TextDocumentCompletion(p: CompletionParams) = async { let! result = async { use! _scope = acquireRo "TextDocumentCompletion" in return! inner.TextDocumentCompletion(p) } in return result }
+    override _.CompletionItemResolve(p) = async { let! result = async { use! _scope = acquireRo "CompletionItemResolve" in return! inner.CompletionItemResolve(p) } in return result }
+    override _.TextDocumentSignatureHelp(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentSignatureHelp" in return! inner.TextDocumentSignatureHelp(p) } in return result }
+    override _.TextDocumentHover(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentHover" in return! inner.TextDocumentHover(p) } in return result }
+    override _.TextDocumentRename(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentRename" in return! inner.TextDocumentRename(p) } in return result }
+    override _.TextDocumentReferences(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentReferences" in return! inner.TextDocumentReferences(p) } in return result }
+    override _.TextDocumentDefinition(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentDefinition" in return! inner.TextDocumentDefinition(p) } in return result }
+    override _.TextDocumentTypeDefinition(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentTypeDefinition" in return! inner.TextDocumentTypeDefinition(p) } in return result }
+    override _.TextDocumentDocumentHighlight(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentDocumentHighlight" in return! inner.TextDocumentDocumentHighlight(p) } in return result }
+    override _.TextDocumentImplementation(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentImplementation" in return! inner.TextDocumentImplementation(p) } in return result }
+    override _.TextDocumentDocumentSymbol(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentDocumentSymbol" in return! inner.TextDocumentDocumentSymbol(p) } in return result }
+    override _.WorkspaceSymbol(p) = async { let! result = async { use! _scope = acquireRo "WorkspaceSymbol" in return! inner.WorkspaceSymbol(p) } in return result }
+    override _.TextDocumentFormatting(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentFormatting" in return! inner.TextDocumentFormatting(p) } in return result }
+    override _.TextDocumentRangeFormatting(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentRangeFormatting" in return! inner.TextDocumentRangeFormatting(p) } in return result }
+    override _.TextDocumentCodeAction(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentCodeAction" in return! inner.TextDocumentCodeAction(p) } in return result }
+    override _.TextDocumentCodeLens(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentCodeLens" in return! inner.TextDocumentCodeLens(p) } in return result }
+    override _.CodeLensResolve(p) = async { let! result = async { use! _scope = acquireRo "CodeLensResolve" in return! inner.CodeLensResolve(p) } in return result }
+    override _.TextDocumentInlayHint(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentInlayHint" in return! inner.TextDocumentInlayHint(p) } in return result }
+    override _.TextDocumentFoldingRange(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentFoldingRange" in return! inner.TextDocumentFoldingRange(p) } in return result }
+    override _.TextDocumentSelectionRange(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentSelectionRange" in return! inner.TextDocumentSelectionRange(p) } in return result }
+    override _.TextDocumentSemanticTokensFull(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentSemanticTokensFull" in return! inner.TextDocumentSemanticTokensFull(p) } in return result }
+    override _.TextDocumentSemanticTokensRange(p) = async { let! result = async { use! _scope = acquireRo "TextDocumentSemanticTokensRange" in return! inner.TextDocumentSemanticTokensRange(p) } in return result }
+
+    override _.FSharpSignature(p) = async { let! result = async { use! _scope = acquireRo "FSharpSignature" in return! inner.FSharpSignature(p) } in return result }
+    override _.FSharpSignatureData(p) =  async { let! result = async { use! _scope = acquireRo "FSharpSignatureData" in return! inner.FSharpSignatureData(p) } in return result }
+
+    override _.FSharpDocumentationGenerator(p) = inner.FSharpDocumentationGenerator(p)
+    override _.FSharpLineLense(p) = inner.FSharpCompilerLocation(p)
+    override _.FSharpCompilerLocation(p) = inner.FSharpCompilerLocation(p)
+
+    override _.FSharpWorkspaceLoad(p: WorkspaceLoadParms) =
+      async {
+        let! result = inner.FSharpWorkspaceLoad(p)
+
+        if not isReady then
+          startLoop() |> ignore
+
+        isReady <- true
+        logger.debug (Log.setMessage "triggering ready")
+        ready.Trigger()
+
+        task {
+          do! Task.Delay(1000)
+          logger.debug (Log.setMessage "triggering ready again for sure")
+          ready.Trigger()
+        } |> ignore
+
+        return result
+      }
+
+    override _.LoadAnalyzers(path: obj) = inner.LoadAnalyzers(path)
+    override _.FSharpWorkspacePeek(p: WorkspacePeekRequest) = inner.FSharpWorkspacePeek(p)
+    override _.FSharpProject(p: ProjectParms) = inner.FSharpProject(p)
+    override _.FSharpFsdn(p: FsdnRequest) = inner.FSharpFsdn(p)
+    override _.FSharpDotnetNewList(p: DotnetNewListRequest) = inner.FSharpDotnetNewList(p)
+    override _.FSharpDotnetNewRun(p: DotnetNewRunRequest) = inner.FSharpDotnetNewRun(p)
+    override _.FSharpDotnetAddProject(p: DotnetProjectRequest) = inner.FSharpDotnetAddProject(p)
+    override _.FSharpDotnetRemoveProject(p: DotnetProjectRequest) = inner.FSharpDotnetRemoveProject(p)
+    override _.FSharpDotnetSlnAdd(p: DotnetProjectRequest) = inner.FSharpDotnetSlnAdd(p)
+    override _.FsProjMoveFileUp(p: DotnetFileRequest) = inner.FsProjMoveFileUp(p)
+    override _.FsProjMoveFileDown(p: DotnetFileRequest) = inner.FsProjMoveFileDown(p)
+    override _.FsProjAddFileAbove(p: DotnetFile2Request) = inner.FsProjAddFileAbove(p)
+    override _.FsProjAddFileBelow(p: DotnetFile2Request) = inner.FsProjAddFileBelow(p)
+    override _.FsProjAddFile(p: DotnetFileRequest) = inner.FsProjAddFile(p)
+    override _.FsProjAddExistingFile(p: DotnetFileRequest) = inner.FsProjAddExistingFile(p)
+    override _.FsProjRemoveFile(p: DotnetFileRequest) = inner.FsProjRemoveFile(p)
+    override _.FSharpHelp(p: TextDocumentPositionParams) = inner.FSharpHelp(p)
+    override _.FSharpDocumentation(p: TextDocumentPositionParams) = inner.FSharpDocumentation(p)
+    override _.FSharpDocumentationSymbol(p: DocumentationForSymbolReuqest) = inner.FSharpDocumentationSymbol(p)
+    override _.FSharpLiterateRequest(p: FSharpLiterateRequest) = inner.FSharpLiterateRequest(p) // not implemented
+    override _.FSharpPipelineHints(p: FSharpPipelineHintRequest) = inner.FSharpPipelineHints(p)
+
+    override _.Dispose() =
+      chan.Writer.WriteAsync(("shutdown", false, null)) |> ignore // let it shutdown
+      inner.Dispose()
+
 module FSharpLspServer =
 
   open System.Threading.Tasks
@@ -2945,7 +3214,7 @@ module FSharpLspServer =
       let state = State.Initial toolsPath stateStorageDir workspaceLoaderFactory
       let originalFs = FSharp.Compiler.IO.FileSystemAutoOpens.FileSystem
       FSharp.Compiler.IO.FileSystemAutoOpens.FileSystem <- FsAutoComplete.FileSystem(originalFs, state.Files.TryFind)
-      new FSharpLspServer(state, lspClient) :> IFSharpLspServer
+      new FSharpLspServerWithLocking(new FSharpLspServer(state, lspClient)) :> IFSharpLspServer
 
 
     Ionide.LanguageServerProtocol.Server.start requestsHandlings input output FSharpLspClient regularServer createRpc
